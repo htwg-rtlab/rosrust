@@ -126,7 +126,7 @@ fn process_name(name: &str) -> Result<String, Error> {
 }
 
 fn is_legal_first_char(v: u8) -> bool {
-    v >= b'A' && v <= b'Z' || v >= b'a' && v <= b'z'
+    v >= b'A' && v <= b'Z' || v >= b'a' && v <= b'z' || v >= b'0' && v <= b'9'
 }
 
 fn is_legal_char(v: u8) -> bool {
