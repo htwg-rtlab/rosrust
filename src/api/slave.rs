@@ -1,9 +1,9 @@
-use rosxmlrpc;
+use futures::sync::mpsc::channel as futures_channel;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc::channel;
 use std::thread;
-use super::error::{self, ErrorKind, Result};
+use super::error::{self, ErrorKind, Result, ResultExt};
 use super::slavehandler::{add_publishers_to_subscription, SlaveHandler};
 use tcpros::{Message, Publisher, PublisherStream, Subscriber, Service, ServicePair, ServiceResult};
 
@@ -19,60 +19,86 @@ type SerdeResult<T> = Result<T>;
 
 impl Slave {
     pub fn new(master_uri: &str, hostname: &str, port: u16, name: &str) -> Result<Slave> {
-        let (shutdown_tx, shutdown_rx) = channel();
+        use std::net::ToSocketAddrs;
+        use futures::{Future, Stream};
+
+        let (shutdown_tx, shutdown_rx) = futures_channel(1);
         let handler = SlaveHandler::new(master_uri, hostname, name, shutdown_tx);
         let pubs = handler.publications.clone();
         let subs = handler.subscriptions.clone();
         let services = handler.services.clone();
-        let mut server = rosxmlrpc::Server::new(hostname, port, handler)?;
-        let uri = server.uri.clone();
+        let (port_tx, port_rx) = channel();
+        let socket_addr = match (hostname, port).to_socket_addrs()?.next() {
+            Some(socket_addr) => socket_addr,
+            None => bail!("Bad address provided: {}:{}", hostname, port),
+        };
+
         thread::spawn(move || {
-            match shutdown_rx.recv() {
-                Ok(..) => info!("ROS Slave API shutdown by remote request"),
-                Err(..) => info!("ROS Slave API shutdown by ROS client destruction"),
+            let bound_handler = match handler.bind(&socket_addr) {
+                Ok(v) => v,
+                Err(err) => {
+                    port_tx.send(Err(err)).expect(FAILED_TO_LOCK);
+                    return;
+                }
             };
-            if let Err(err) = server.shutdown() {
-                info!("Error during ROS Slave API shutdown: {}", err);
+            let port = bound_handler.local_addr().map(|v| v.port());
+            port_tx.send(port).expect(FAILED_TO_LOCK);
+            let shutdown_future = shutdown_rx.into_future().map(|_| ()).map_err(|_| ());
+            if let Err(err) = bound_handler.run_until(shutdown_future) {
+                info!("Error during ROS Slave API initiation: {}", err);
             }
         });
+
+        let port = port_rx.recv().expect(FAILED_TO_LOCK).chain_err(
+            || "Failed to get port",
+        )?;
+        let uri = format!("http://{}:{}/", hostname, port);
+
         Ok(Slave {
-               name: String::from(name),
-               uri: uri,
-               publications: pubs,
-               subscriptions: subs,
-               services: services,
-           })
+            name: String::from(name),
+            uri: uri,
+            publications: pubs,
+            subscriptions: subs,
+            services: services,
+        })
     }
 
     pub fn uri(&self) -> &str {
         return &self.uri;
     }
 
-    pub fn add_publishers_to_subscription<T>(&mut self,
-                                             topic: &str,
-                                             publishers: T)
-                                             -> SerdeResult<()>
-        where T: Iterator<Item = String>
+    pub fn add_publishers_to_subscription<T>(
+        &mut self,
+        topic: &str,
+        publishers: T,
+    ) -> SerdeResult<()>
+    where
+        T: Iterator<Item = String>,
     {
-        add_publishers_to_subscription(&mut self.subscriptions.lock().expect(FAILED_TO_LOCK),
-                                       &self.name,
-                                       topic,
-                                       publishers)
+        add_publishers_to_subscription(
+            &mut self.subscriptions.lock().expect(FAILED_TO_LOCK),
+            &self.name,
+            topic,
+            publishers,
+        )
     }
 
-    pub fn add_service<T, F>(&mut self,
-                             hostname: &str,
-                             service: &str,
-                             handler: F)
-                             -> SerdeResult<String>
-        where T: ServicePair,
-              F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static
+    pub fn add_service<T, F>(
+        &mut self,
+        hostname: &str,
+        service: &str,
+        handler: F,
+    ) -> SerdeResult<String>
+    where
+        T: ServicePair,
+        F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static,
     {
         use std::collections::hash_map::Entry;
-        match self.services
-                  .lock()
-                  .expect(FAILED_TO_LOCK)
-                  .entry(String::from(service)) {
+        match self.services.lock().expect(FAILED_TO_LOCK).entry(
+            String::from(
+                service,
+            ),
+        ) {
             Entry::Occupied(..) => {
                 error!("Duplicate initiation of service '{}' attempted", service);
                 Err(ErrorKind::Duplicate("service".into()).into())
@@ -90,17 +116,18 @@ impl Slave {
         self.services.lock().expect(FAILED_TO_LOCK).remove(service);
     }
 
-    pub fn add_publication<T>(&mut self,
-                              hostname: &str,
-                              topic: &str)
-                              -> error::tcpros::Result<PublisherStream<T>>
-        where T: Message
+    pub fn add_publication<T>(
+        &mut self,
+        hostname: &str,
+        topic: &str,
+    ) -> error::tcpros::Result<PublisherStream<T>>
+    where
+        T: Message,
     {
         use std::collections::hash_map::Entry;
-        match self.publications
-                  .lock()
-                  .expect(FAILED_TO_LOCK)
-                  .entry(String::from(topic)) {
+        match self.publications.lock().expect(FAILED_TO_LOCK).entry(
+            String::from(topic),
+        ) {
             Entry::Occupied(publisher_entry) => publisher_entry.get().stream(),
             Entry::Vacant(entry) => {
                 let publisher = Publisher::new::<T, _>(format!("{}:0", hostname).as_str(), topic)?;
@@ -110,21 +137,20 @@ impl Slave {
     }
 
     pub fn remove_publication(&mut self, topic: &str) {
-        self.publications
-            .lock()
-            .expect(FAILED_TO_LOCK)
-            .remove(topic);
+        self.publications.lock().expect(FAILED_TO_LOCK).remove(
+            topic,
+        );
     }
 
     pub fn add_subscription<T, F>(&mut self, topic: &str, callback: F) -> Result<()>
-        where T: Message,
-              F: Fn(T) -> () + Send + 'static
+    where
+        T: Message,
+        F: Fn(T) -> () + Send + 'static,
     {
         use std::collections::hash_map::Entry;
-        match self.subscriptions
-                  .lock()
-                  .expect(FAILED_TO_LOCK)
-                  .entry(String::from(topic)) {
+        match self.subscriptions.lock().expect(FAILED_TO_LOCK).entry(
+            String::from(topic),
+        ) {
             Entry::Occupied(..) => {
                 error!("Duplicate subscription to topic '{}' attempted", topic);
                 Err(ErrorKind::Duplicate("subscription".into()).into())
@@ -138,10 +164,9 @@ impl Slave {
     }
 
     pub fn remove_subscription(&mut self, topic: &str) {
-        self.subscriptions
-            .lock()
-            .expect(FAILED_TO_LOCK)
-            .remove(topic);
+        self.subscriptions.lock().expect(FAILED_TO_LOCK).remove(
+            topic,
+        );
     }
 }
 

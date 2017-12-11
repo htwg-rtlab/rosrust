@@ -1,67 +1,84 @@
-use hyper;
-use rustc_serialize::{Encodable, Decodable};
-use super::error::{self, ErrorKind, Result};
-use super::serde;
+use std::sync::Mutex;
+use serde::{Deserialize, Serialize};
+use xml_rpc::{self, Value, Params};
+use super::{Response, ResponseError, ERROR_CODE, FAILURE_CODE, SUCCESS_CODE};
 
 pub struct Client {
-    http_client: hyper::Client,
-    server_uri: String,
+    client: Mutex<xml_rpc::Client>,
+    master_uri: String,
 }
 
 impl Client {
-    pub fn new(server_uri: &str) -> Client {
-        Client {
-            http_client: hyper::Client::new(),
-            server_uri: String::from(server_uri),
-        }
+    pub fn new(master_uri: &str) -> Result<Client, xml_rpc::error::Error> {
+        Ok(Client {
+            client: Mutex::new(xml_rpc::Client::new()?),
+            master_uri: master_uri.to_owned(),
+        })
     }
 
-    pub fn request_tree(&self, request: Request) -> Result<serde::XmlRpcValue> {
-        let mut body = Vec::<u8>::new();
-        request.encoder.write_request(&request.name, &mut body)?;
-
-        let body = String::from_utf8(body)?;
-        let res = self.http_client.post(&self.server_uri).body(&body).send()?;
-
-        let mut res = serde::Decoder::new_response(res)?;
-        match res.pop() {
-            Some(v) => Ok(v.value()),
-            None => {
-                bail!(ErrorKind::Serde(error::serde::ErrorKind::Decoding("request tree".into())))
+    pub fn request_tree_with_tree(&self, name: &str, params: Params) -> Response<Value> {
+        let mut client = self.client.lock().map_err(|err| {
+            ResponseError::Client(format!("Failed to acquire lock on socket: {}", err))
+        })?;
+        let mut response = client
+            .call_value(&self.master_uri.parse().unwrap(), name, params)
+            .map_err(|err| {
+                ResponseError::Client(format!("Failed to perform call to server: {}", err))
+            })?
+            .map_err(|fault| {
+                ResponseError::Client(format!(
+                    "Unexpected fault #{} received from server: {}",
+                    fault.code,
+                    fault.message
+                ))
+            })?
+            .into_iter();
+        let mut first_item = response.next();
+        while let Some(Value::Array(v)) = first_item {
+            response = v.into_iter();
+            first_item = response.next();
+        }
+        match (first_item, response.next(), response.next()) {
+            (Some(Value::Int(code)), Some(Value::String(message)), Some(data)) => {
+                match code {
+                    ERROR_CODE => Err(ResponseError::Client(message)),
+                    FAILURE_CODE => Err(ResponseError::Server(message)),
+                    SUCCESS_CODE => Ok(data),
+                    _ => Err(ResponseError::Server(
+                        format!("Bad response code returned from server"),
+                    )),
+                }
+            }
+            (code, message, data) => {
+                Err(ResponseError::Server(format!(
+                    "Response with three parameters (int code, str msg, value) \
+                    expected from server, received: ({:?}, {:?}, {:?})",
+                    code,
+                    message,
+                    data
+                )))
             }
         }
     }
 
-    pub fn request<T: Decodable>(&self, request: Request) -> Result<T> {
-        let mut body = Vec::<u8>::new();
-        request.encoder.write_request(&request.name, &mut body)?;
-
-        let body = String::from_utf8(body)?;
-        let res = self.http_client.post(&self.server_uri).body(&body).send()?;
-
-        let mut res = serde::Decoder::new_response(res)?;
-        let mut value = match res.pop() {
-            Some(v) => v,
-            None => bail!(ErrorKind::Serde(error::serde::ErrorKind::Decoding("request".into()))),
-        };
-        T::decode(&mut value).map_err(|v| v.into())
-    }
-}
-
-pub struct Request {
-    name: String,
-    encoder: serde::Encoder,
-}
-
-impl Request {
-    pub fn new(function_name: &str) -> Request {
-        Request {
-            name: String::from(function_name),
-            encoder: serde::Encoder::new(),
-        }
+    pub fn request_tree<S>(&self, name: &str, params: &S) -> Response<Value>
+    where
+        S: Serialize,
+    {
+        let params = xml_rpc::into_params(params).map_err(|err| {
+            ResponseError::Client(format!("Failed to serialize parameters: {}", err))
+        })?;
+        self.request_tree_with_tree(name, params)
     }
 
-    pub fn add<T: Encodable>(&mut self, parameter: &T) -> error::serde::Result<()> {
-        parameter.encode(&mut self.encoder)
+    pub fn request<'a, S, D>(&self, name: &str, params: &S) -> Response<D>
+    where
+        S: Serialize,
+        D: Deserialize<'a>,
+    {
+        let data = self.request_tree(name, params)?;
+        Deserialize::deserialize(data).map_err(|err| {
+            ResponseError::Server(format!("Response data has unexpected structure: {}", err))
+        })
     }
 }

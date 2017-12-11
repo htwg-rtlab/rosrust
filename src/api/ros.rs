@@ -1,14 +1,12 @@
-use rustc_serialize::{Encodable, Decodable};
-use super::master::{self, Master};
+use serde::{Serialize, Deserialize};
+use super::master::{self, Master, Topic};
 use super::slave::Slave;
 use super::error::{ErrorKind, Result};
-use super::error::master::Result as MasterResult;
-use super::value::Topic;
+use super::super::rosxmlrpc::Response;
 use super::naming::{self, Resolver};
 use super::resolve;
 use tcpros::{Client, Message, PublisherStream, ServicePair, ServiceResult};
-use rosxmlrpc::serde::XmlRpcValue;
-use std::time::Duration;
+use xml_rpc;
 
 pub struct Ros {
     master: Master,
@@ -35,7 +33,9 @@ impl Ros {
         let namespace = namespace.trim_right_matches("/");
 
         if name.contains("/") {
-            bail!(ErrorKind::Naming(naming::error::ErrorKind::IllegalCharacter(name.into())));
+            bail!(ErrorKind::Naming(
+                naming::error::ErrorKind::IllegalCharacter(name.into()),
+            ));
         }
 
         let name = format!("{}/{}", namespace, name);
@@ -44,12 +44,12 @@ impl Ros {
         let slave = Slave::new(&master_uri, &hostname, 0, &name)?;
         let master = Master::new(&master_uri, &name, &slave.uri());
         Ok(Ros {
-               master: master,
-               slave: slave,
-               hostname: String::from(hostname),
-               resolver: resolver,
-               name: name,
-           })
+            master: master,
+            slave: slave,
+            hostname: String::from(hostname),
+            resolver: resolver,
+            name: name,
+        })
     }
 
     fn map(&mut self, source: &str, destination: &str) -> Result<()> {
@@ -69,27 +69,26 @@ impl Ros {
     }
 
     pub fn param<'a, 'b>(&'a self, name: &'b str) -> Option<Parameter<'a>> {
-        self.resolver
-            .translate(name)
-            .ok()
-            .map(|v| {
-                     Parameter {
-                         master: &self.master,
-                         name: v,
-                     }
-                 })
+        self.resolver.translate(name).ok().map(|v| {
+            Parameter {
+                master: &self.master,
+                name: v,
+            }
+        })
     }
 
-    pub fn parameters(&self) -> MasterResult<Vec<String>> {
+    pub fn parameters(&self) -> Response<Vec<String>> {
         self.master.get_param_names()
     }
 
-    pub fn state(&self) -> MasterResult<master::SystemState> {
-        self.master.get_system_state()
+    pub fn state(&self) -> Response<master::SystemState> {
+        self.master.get_system_state().map(Into::into)
     }
 
-    pub fn topics(&self) -> MasterResult<Vec<Topic>> {
-        self.master.get_topic_types()
+    pub fn topics(&self) -> Response<Vec<Topic>> {
+        self.master.get_topic_types().map(|v| {
+            v.into_iter().map(Into::into).collect()
+        })
     }
 
     pub fn client<T: ServicePair>(&self, service: &str) -> Result<Client<T>> {
@@ -128,12 +127,16 @@ impl Ros {
     }
 
     pub fn service<T, F>(&mut self, service: &str, handler: F) -> Result<()>
-        where T: ServicePair,
-              F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static
+    where
+        T: ServicePair,
+        F: Fn(T::Request) -> ServiceResult<T::Response> + Send + Sync + 'static,
     {
         let name = self.resolver.translate(service)?;
-        let api = self.slave
-            .add_service::<T, F>(&self.hostname, &name, handler)?;
+        let api = self.slave.add_service::<T, F>(
+            &self.hostname,
+            &name,
+            handler,
+        )?;
 
         if let Err(err) = self.master.register_service(&name, &api) {
             self.slave.remove_service(&name);
@@ -146,20 +149,25 @@ impl Ros {
     }
 
     pub fn subscribe<T, F>(&mut self, topic: &str, callback: F) -> Result<()>
-        where T: Message,
-              F: Fn(T) -> () + Send + 'static
+    where
+        T: Message,
+        F: Fn(T) -> () + Send + 'static,
     {
         let name = self.resolver.translate(topic)?;
         self.slave.add_subscription::<T, F>(&name, callback)?;
 
         match self.master.register_subscriber(&name, &T::msg_type()) {
             Ok(publishers) => {
-                if let Err(err) =
-                    self.slave
-                        .add_publishers_to_subscription(&name, publishers.into_iter()) {
-                    error!("Failed to subscribe to all publishers of topic '{}': {}",
-                           name,
-                           err);
+                if let Err(err) = self.slave.add_publishers_to_subscription(
+                    &name,
+                    publishers.into_iter(),
+                )
+                {
+                    error!(
+                        "Failed to subscribe to all publishers of topic '{}': {}",
+                        name,
+                        err
+                    );
                 }
                 Ok(())
             }
@@ -172,16 +180,19 @@ impl Ros {
     }
 
     pub fn publish<T>(&mut self, topic: &str) -> Result<PublisherStream<T>>
-        where T: Message
+    where
+        T: Message,
     {
         let name = self.resolver.translate(topic)?;
         let stream = self.slave.add_publication::<T>(&self.hostname, &name)?;
         match self.master.register_publisher(&name, &T::msg_type()) {
             Ok(_) => Ok(stream),
             Err(error) => {
-                error!("Failed to register publisher for topic '{}': {}",
-                       name,
-                       error);
+                error!(
+                    "Failed to register publisher for topic '{}': {}",
+                    name,
+                    error
+                );
                 self.slave.remove_publication(&name);
                 self.master.unregister_publisher(&name)?;
                 Err(error.into())
@@ -200,27 +211,27 @@ impl<'a> Parameter<'a> {
         &self.name
     }
 
-    pub fn get<T: Decodable>(&self) -> MasterResult<T> {
+    pub fn get<'b, T: Deserialize<'b>>(&self) -> Response<T> {
         self.master.get_param::<T>(&self.name)
     }
 
-    pub fn get_raw(&self) -> MasterResult<XmlRpcValue> {
+    pub fn get_raw(&self) -> Response<xml_rpc::Value> {
         self.master.get_param_any(&self.name)
     }
 
-    pub fn set<T: Encodable>(&self, value: &T) -> MasterResult<()> {
+    pub fn set<T: Serialize>(&self, value: &T) -> Response<()> {
         self.master.set_param::<T>(&self.name, value).and(Ok(()))
     }
 
-    pub fn delete(&self) -> MasterResult<()> {
+    pub fn delete(&self) -> Response<()> {
         self.master.delete_param(&self.name).and(Ok(()))
     }
 
-    pub fn exists(&self) -> MasterResult<bool> {
+    pub fn exists(&self) -> Response<bool> {
         self.master.has_param(&self.name)
     }
 
-    pub fn search(&self) -> MasterResult<String> {
+    pub fn search(&self) -> Response<String> {
         self.master.search_param(&self.name)
     }
 }
