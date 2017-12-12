@@ -158,21 +158,33 @@ fn get_message(folders: &[&str], package: &str, name: &str) -> Result<MessageCas
             f.read_to_string(&mut contents).chain_err(
                 || "Failed to read file to string!",
             )?;
-            let mut parts = contents.split("\n---");
-            let req = match parts.next() {
-                Some(v) => v,
-                None => bail!("Service needs to have content"),
-            };
-            let res = match parts.next() {
-                Some(v) => v,
-                None => bail!("Service needs to be split into two parts"),
-            };
-            if parts.next().is_some() {
-                bail!("Too many splits in service");
+            let mut parts = contents.split("---");
+            if parts.clone().count() < 2 {
+                let req= "";
+                let res = match parts.next() {
+                    Some(v) => v,
+                    None => bail!("if: Service needs to be split into two parts"),
+                };
+                let req = Msg::new(&package, &format!("{}Req", name), req)?;
+                let res = Msg::new(&package, &format!("{}Res", name), res)?;
+                return Ok(MessageCase::Service(name.into(), req, res));
+            } else {
+                let req = match parts.next() {
+                    Some(v) => v,
+                    None => bail!("Service needs to have content"),
+                };
+                let res = match parts.next() {
+                    Some(v) => v,
+                    None => bail!("else: Service needs to be split into two parts"),
+                };
+                if parts.next().is_some() {
+                    bail!("Too many splits in service");
+                }
+                let req = Msg::new(&package, &format!("{}Req", name), req)?;
+                let res = Msg::new(&package, &format!("{}Res", name), res)?;
+                return Ok(MessageCase::Service(name.into(), req, res));
             }
-            let req = Msg::new(&package, &format!("{}Req", name), req)?;
-            let res = Msg::new(&package, &format!("{}Res", name), res)?;
-            return Ok(MessageCase::Service(name.into(), req, res));
+
         }
     }
     bail!(format!(
